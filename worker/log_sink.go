@@ -1,25 +1,39 @@
-// 数据库 IO 是慢操作。如果每个任务都阻塞等待写库，Worker 的吞吐量会暴跌。
-// 我设计了一个 LogSink，利用 Channel + 独立协程 异步写库，
-// 甚至可以做批量插入（Batch Insert）优化。
+/*
+Kafka重构版：
+核心变化有三个：
+存储介质变了：从直接写 MongoDB 变成先写 Kafka
+结构设计变了：LogSink 字段、初始化逻辑、后台协程都变了
+职责边界变了：原来是“日志落库模块”，现在是“日志投递到 Kafka 的生产者模块”，落库可以交给独立消费服务做
+*/
+
 package main
 
 import (
-	"context"
+	"encoding/json"
 	"fmt"
 	"my-cron/common"
 	"os"
-	"time"
+	"strings"
 
 	"github.com/IBM/sarama"
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/mongo"
-	"go.mongodb.org/mongo-driver/mongo/options"
+	"go.uber.org/zap"
 )
 
 // 全局单例
 var G_logSink *LogSink
 
 // LogSink 负责将日志发送到 Kafka (重构版)
+/*
+原版
+拿着 mongo.Client 和 collection，直接操作 Mongo
+主通道 logChan，预留了 autoCommitChan 做批量写
+偏向“数据库 DAO + 异步队列”的设计
+《----------------》
+重构版
+不再关心数据库，只关心 Kafka 生产者和 Topic
+没有内部 chan 了，借用 sarama.AsyncProducer 自带的缓冲和协程
+LogSink 的职责从“写库”转成“发消息”
+*/
 type LogSink struct {
 	producer sarama.AsyncProducer // 改为：Kafka 异步生产者
 	topic    string               // Kafka Topic 名字
@@ -27,64 +41,79 @@ type LogSink struct {
 
 // InitLogSink 初始化日志汇聚点
 func InitLogSink() error {
-	//1 建立连接（设置超时时间）
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+	//1、读取环境变量中的Kafka地址，没有则用本地默认值
+	brokersEnv := os.Getenv("KAFKA_BROKERS")
+	if brokersEnv == "" {
+		brokersEnv = "127.0.0.1:9092"
+	}
+	brokers := strings.Split(brokersEnv, ",")
 
-	//连接本地MongoDB
-	// 修改为读取环境变量，如果没有则默认 localhost (兼容本地开发)
-	uri := os.Getenv("MONGO_URI")
-	if uri == "" {
-		uri = "mongodb://localhost:27017"
-	}
-	client, err := mongo.Connect(ctx, options.Client().ApplyURI(uri))
+	//2、配置Sarma 生产者参数
+	config := sarama.NewConfig()
+	//WaitForAll 标识等待所有副本同步完成才返回，保证数据的最高可靠性
+	config.Producer.RequiredAcks = sarama.WaitForAll
+	//随机分区发送，均匀打散流量
+	config.Producer.Partitioner = sarama.NewRandomPartitioner
+	//异步模式下，开启捕获Error用于监控，关闭Success提高性能
+	config.Producer.Return.Successes = false
+	config.Producer.Return.Errors = true
+
+	//3、创建异步生产者（高吞吐的核心）
+	producer, err := sarama.NewAsyncProducer(brokers, config)
 	if err != nil {
-		return err
+		return fmt.Errorf("连接kafka失败:%v", err)
 	}
-	//2 选择数据库和表（cron-log）
+	//4、启动后台协程，专门处理异步投递失败的错误日志
+	go func() {
+		for err := range producer.Errors() {
+
+			/*
+				if G_logger != nil (首选方案：专业日志)： 如果全局的 Zap 日志对象 (G_logger) 已经成功初始化了，
+				我们就使用它来打出结构化的高级日志。
+				这对应着代码里的 G_logger.Error("写入 Kafka 失败", zap.Error(err))。
+				else (兜底方案：控制台打印)： 如果 G_logger 还没来得及初始化，或者因为某种异常变成了空指针 (nil)，
+				为了防止程序直接崩溃（在 Go 语言中，调用空指针的方法会直接引发 Panic 导致程序死掉），
+				我们就退而求其次，使用最基础的 fmt.Println(...) 把错误强行打印到控制台。
+			*/
+			if G_logger != nil {
+				G_logger.Error("写入Kafka失败", zap.Error(err))
+			} else {
+				fmt.Println("写入Kafka失败", err)
+			}
+		}
+	}()
+	//5、实例化单例
 	G_logSink = &LogSink{
-		client:     client,
-		collection: client.Database("cron").Collection("log"),
-		logChan:    make(chan *common.JobLog, 1000), //缓冲Channel，防阻塞
+		producer: producer,
+		topic:    "cron_logs", //把日志统一投递到这个Topic
 	}
-	//创建TTL索引（自动删除7天前日志）
-	//这是一个后台操作，只需执行一次，重复执行也没事
-	indexModel := mongo.IndexModel{
-		Keys: bson.D{{Key: "startTime", Value: 1}}, // 索引基于 startTime 字段
-		Options: options.Index().
-			SetExpireAfterSeconds(7 * 24 * 3600), // 设置过期时间：7天 (秒)
-	}
-	_, err = G_logSink.collection.Indexes().CreateOne(ctx, indexModel)
-	if err != nil {
-		fmt.Println("警告：创建TTL索引失败:", err)
-	} else {
-		fmt.Println("成功创建日志TTL索引，日志将保留7天")
-	}
-
-	//3 启动后台协程，专门处理日志写入
-	go G_logSink.writeLoop()
-	fmt.Println("MongoDB日志模块初始化成功")
+	fmt.Println("kafka 日志生产者初始化成功，Brokers:", brokers)
 	return nil
 }
 
 // Append发送日志（对外暴露的方法）
-func (sink *LogSink) Append(log *common.JobLog) {
-	select {
-	case sink.logChan <- log:
-	default:
-		// 极端情况：如果日志写的太慢，channel 满了，为了不阻塞任务执行，
-		// 这里选择丢弃日志 (或者打印一条错误)
-		fmt.Println("警告：日志队列已满，丢弃日志", log.JobName)
+func (sink *LogSink) Append(jobLog *common.JobLog) {
+	//1、将结构体序列化为JSON
+	bytes, err := json.Marshal(jobLog)
+	if err != nil {
+		if G_logger != nil {
+			G_logger.Error("日志序列化失败", zap.Error(err))
+		}
+		return
 	}
-}
-
-// writeLoop后台写入
-func (sink *LogSink) writeLoop() {
-	for log := range sink.logChan {
-		//插入MongoDB
-		_, err := sink.collection.InsertOne(context.TODO(), log)
-		if err != nil {
-			fmt.Println("写入日志失败")
+	//2、构造kafka消息
+	msg := &sarama.ProducerMessage{
+		Topic: sink.topic,
+		Value: sarama.ByteEncoder(bytes),
+	}
+	//3、异步发送到Kafka（非阻塞，像发子弹一样快）
+	select {
+	case sink.producer.Input() <- msg:
+		//发送指令已经提交给sarama内部协程
+	default:
+		//极端情况kafka彻底宕机导致sarama内部channel满载
+		if G_logger != nil {
+			G_logger.Warn("Kafka发送队列已满，丢弃日志", zap.String("jobName", jobLog.JobName))
 		}
 	}
 }
