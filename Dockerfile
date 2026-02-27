@@ -22,7 +22,8 @@ RUN go build -o worker-bin ./worker/
 
 #编译Mock Server
 RUN go build -o mock-bin ./mock_server/main.go
-
+ # 编译Log-Consumer
+ RUN go build -o consumer-bin ./log_consumer/main.go
 #===第二阶段：运行（runner）===
 #使用极小的Alpine镜像（5MB）
 FROM alpine:latest
@@ -33,5 +34,6 @@ WORKDIR /root/
 COPY --from=builder /app/master-bin .
 COPY --from=builder /app/worker-bin .
 COPY --from=builder /app/mock-bin .
+COPY --from=builder /app/consumer-bin .
 #这一步仅仅是说明，具体运行哪个由docker-compose决定
 CMD ["./master-bin"]
