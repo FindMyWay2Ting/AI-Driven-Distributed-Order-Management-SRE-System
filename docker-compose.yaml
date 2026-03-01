@@ -113,3 +113,12 @@ services:
     depends_on:
       - kafka
       - mongo
+  # 🚀 [新增服务] 负责监听死信队列并报警
+  alert-service:
+    build: .
+    container_name: cron-alert
+    command: ./alert-bin
+    environment:
+      - KAFKA_BROKERS=kafka:9092
+    depends_on:
+      - kafka

@@ -53,7 +53,7 @@ func initEnv() {
 }
 
 // 核心执行逻辑
-func executeJob(job *common.Job) {
+func executeJob(job *common.Job, client *clientv3.Client) {
 	// 1. 构造日志对象 (保持不变)
 	jobLog := &common.JobLog{
 		JobName:      job.Name,
@@ -133,12 +133,23 @@ func executeJob(job *common.Job) {
 
 	// 5. 最终日志 (Zap)
 	if err != nil {
-		G_logger.Error("任务最终执行失败", //  这才是真正的最终失败
+		G_logger.Error("任务最终执行失败，正在从Etcd中下线该任务", //  这才是真正的最终失败
 			zap.String("jobName", job.Name),
 			zap.Error(err),
 			zap.Int("retried", maxLoop), // 记录重试了多少次
 			zap.Duration("cost", cost),
 		)
+		//[新增] 触发死信警告
+		//将任务名、命令和具体错误信息推送到Kafka
+		G_logSink.SendDLQ(job.Name, job.Command, err.Error())
+
+		// [核心修改]：如果重试次数用尽依然失败，自动下线任务，防止死循环执行
+		_, delErr := client.Delete(context.TODO(), common.JobSaveDir+job.Name)
+		if delErr != nil {
+			G_logger.Error("下线任务失败", zap.String("jobName", job.Name), zap.Error(delErr))
+		} else {
+			G_logger.Info("任务已自动下线", zap.String("jobName", job.Name))
+		}
 	} else {
 		G_logger.Info("任务最终执行成功",
 			zap.String("jobName", job.Name),
@@ -253,7 +264,7 @@ func createJobWithLock(job *common.Job, client *clientv3.Client) func() {
 				kaCancel()                            //停止续约
 				lease.Revoke(context.TODO(), leaseID) //释放锁
 			}()
-			executeJob(job)
+			executeJob(job, client)
 		})
 		//5.如果池子满了(ants.ErrPoolOverload),放弃任务换锁
 		if err != nil {

@@ -14,6 +14,7 @@ import (
 	"my-cron/common"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/IBM/sarama"
 	"go.uber.org/zap"
@@ -114,6 +115,37 @@ func (sink *LogSink) Append(jobLog *common.JobLog) {
 		//极端情况kafka彻底宕机导致sarama内部channel满载
 		if G_logger != nil {
 			G_logger.Warn("Kafka发送队列已满，丢弃日志", zap.String("jobName", jobLog.JobName))
+		}
+	}
+}
+
+// 为了让Worker拥有把彻底失败的任务扔进死信队列的能力，我们需要改两个文件，先改log_sink.go，添加发送死信的方法
+// SendDLQ 发送消息到死信队列
+func (sink *LogSink) SendDLQ(jobName string, command string, errMsg string) {
+	// 1. 构造死信警告内容
+	dlqMsg := map[string]interface{}{
+		"jobName": jobName,
+		"command": command,
+		"errMsg":  errMsg,
+		"time":    time.Now().Local().Format(time.RFC3339),
+	}
+	bytes, _ := json.Marshal(dlqMsg)
+	// 2. 投递到专门的死信Topic (cron_dead_letters)
+	msg := &sarama.ProducerMessage{
+		Topic: "cron_dead_letters",
+		Value: sarama.ByteEncoder(bytes),
+	}
+	// 3. 异步发送，绝不阻塞worker原有流程
+	select {
+	case sink.producer.Input() <- msg:
+		// 提交成功
+		if G_logger != nil {
+			G_logger.Info("✅ 死信已成功投递到 Kafka", zap.String("job", jobName))
+		}
+	case <-time.After(1 * time.Second):
+		// 如果等了 3 秒 Kafka 还没接收（严重网络故障），才做丢弃处理
+		if G_logger != nil {
+			G_logger.Error("❌ 死信队列投递超时(3秒)！Kafka可能发生阻塞", zap.String("job", jobName))
 		}
 	}
 }
