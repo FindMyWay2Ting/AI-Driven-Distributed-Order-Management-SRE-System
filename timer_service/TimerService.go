@@ -154,7 +154,7 @@ func (h *OrderConsumerHandler) ConsumeClaim(session sarama.ConsumerGroupSession,
 			//计算订单过期时间
 			//测试：30秒
 			//生产：30分钟
-			expireTime := time.Now().Add(30 * time.Second).Unix() //表示到期的时间
+			expireTime := time.Now().Add(20 * time.Second).Unix() //表示到期的时间
 			//写入Redisu延迟队列
 			//key：delay_orders
 			//Score:过期时间

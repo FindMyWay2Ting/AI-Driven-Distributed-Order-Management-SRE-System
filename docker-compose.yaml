@@ -225,5 +225,14 @@ services:
     command: ./alert-bin
     environment:
       - KAFKA_BROKERS=kafka:9092
+      - DASHSCOPE_API_KEY=sk-ad406b1d8eff4097badd27a834e4f0dc
     depends_on:
       - kafka
+#启动 Qdrant 向量数据库 (用于存放运维 SOP 和 RAG 知识库)
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: cron-qdrant
+    ports:
+      - "6333:6333" # HTTP 端口，方便我们直接调用 API
+      - "6334:6334" # gRPC 端口
+    

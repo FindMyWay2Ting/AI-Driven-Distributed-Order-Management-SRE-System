@@ -22,9 +22,10 @@ import (
 // 1. 数据模型 (与 Mock Server 保持一致)
 // ==========================================
 type Order struct {
-	ID      uint   `gorm:"primaryKey"`
-	OrderNo string `gorm:"type:varchar(32);uniqueIndex"` //订单号全局唯一
-
+	ID        uint   `gorm:"primaryKey"`
+	OrderNo   string `gorm:"type:varchar(32);uniqueIndex"` //订单号全局唯一
+	UserID    int    `gorm:"index"`                        // 属于哪个用户
+	ProductID int    `gorm:"index"`                        // 买了什么商品
 	// index:idx_status_created 表示和 CreatedAt 组成联合索引，
 	// 适合按状态 + 创建时间查询，比如扫描超时未支付订单。
 	Status    int       `gorm:"index:idx_status_created"` //0:未支付，1：已支付；2：已关闭（包括超时取消）
@@ -174,6 +175,7 @@ func (h *workerConsumerHandler) ConsumeClaim(session sarama.ConsumerGroupSession
 		if processErr == nil {
 			// 只有彻底成功了，才标记消息，等待后台批量提交
 			session.MarkMessage(msg, "")
+			session.Commit()
 			logger.Info("✅ 订单取消成功", zap.String("orderNo", orderNo))
 			fmt.Printf("✅ 订单 [%s] 取消成功，已提交 Offset\n", orderNo)
 		} else {
@@ -182,6 +184,7 @@ func (h *workerConsumerHandler) ConsumeClaim(session sarama.ConsumerGroupSession
 			sendToDLQ(orderNo, processErr.Error())
 			// 打入死信队列后，这笔消息就算“处理完”了，标记 Offset 跳过它，防止堵塞整个分区
 			session.MarkMessage(msg, "")
+			session.Commit()
 		}
 	}
 	return nil
@@ -204,6 +207,13 @@ func sendToDLQ(orderNo string, errMsg string) {
 
 // processTimeoutOrder 执行具体的数据库事务操作
 func processTimeoutOrder(orderNo string) error {
+	if strings.HasPrefix(orderNo, "VBUG_") {
+		return fmt.Errorf("外部系统发货接口响应超时，API 熔断")
+	}
+	// 🔥 【Chaos 注入点】遇到 BUG_ 单号，直接模拟数据库死锁异常
+	if strings.HasPrefix(orderNo, "BUG_") {
+		return fmt.Errorf("数据库执行异常: gorm lock wait timeout exceeded; try restarting transaction")
+	}
 	//开启数据库事务
 	tx := db.Begin()
 	//防止panic导致事务悬挂，确保异常回滚
@@ -273,8 +283,9 @@ func processTimeoutOrder(orderNo string) error {
 	// - 避免“先查再改”带来的并发覆盖问题
 	// 实际生产中这里应从 Order_Item 明细表里拉取出真正的商品 ID 和数量。
 	// 这里用伪代码逻辑展示：假设我们反查到这个订单购买了实际的 ProductID
-	actualProductID := 101 // 在真实场景中：actualProductID := order.ProductID
-	if err := tx.Model(&Inventory{}).Where("product_id = ?", actualProductID).UpdateColumn("count", gorm.Expr("count + ?", 1)).Error; err != nil {
+	// 🔥 动态获取实际商品的 ProductID 退库存
+
+	if err := tx.Model(&Inventory{}).Where("product_id = ?", order.ProductID).UpdateColumn("count", gorm.Expr("count + ?", 1)).Error; err != nil {
 		tx.Rollback()
 		return fmt.Errorf("退还库存失败: %v", err)
 	}

@@ -29,7 +29,9 @@ import (
 type Order struct {
 	ID        uint      `gorm:"primaryKey"`
 	OrderNo   string    `gorm:"type:varchar(32);uniqueIndex"`
-	Status    int       `gorm:"index:idx_status_created"` //0:未支付，1：已支付；2：已关闭
+	UserID    int       `gorm:"index"`                    // 属于哪个用户
+	ProductID int       `gorm:"index"`                    // 买了什么商品
+	Status    int       `gorm:"index:idx_status_created"` //0:未支付，1：已支付；2：已关闭;3:挂起订单，由Agent决策
 	CreatedAt time.Time `gorm:"index:idx_status_created"` //创建时间
 }
 
@@ -47,6 +49,13 @@ type EventOutbox struct {
 	Payload  string    `grom:"type:text"` //存放要发送到kafka的json
 	Status   int       `grom:"index"`     //0待发送，1已发送
 	CreateAt time.Time `grom:"index"`
+}
+
+// 商品表，用于区分商品类型（AI Agent 判断不同规则的核心依据）
+type Product struct {
+	ID       uint   `gorm:"primaryKey"`
+	Name     string `gorm:"type:varchar(64)"`
+	Category string `gorm:"type:varchar(32)"` // "electronics"(数码), "seafood"(生鲜), "virtual"(虚拟)
 }
 
 var db *gorm.DB //声明一个全局的数据库连接句柄（指针），指向 GORM 封装后的数据库操作对象
@@ -67,16 +76,23 @@ func initDB() {
 		log.Fatal("MySQL启动失败:", err)
 	}
 
-	//自动建表
-
+	// 自动建表加入 Product
 	db.AutoMigrate(&Order{}, &Inventory{}, &EventOutbox{})
 	//初始化测试数据（如果没有数据的话）
 	var count int64
-	db.Model(&Order{}).Count(&count) //统计Order表中有多少记录，把结果放进count
+	db.Model(&Product{}).Count(&count) //统计Product表中有多少记录，把结果放进count
 	if count == 0 {
-		fmt.Println("正在初始化数据...")
-		//1、初始化库存
-		db.Create(&Inventory{ProductID: 101, Count: 10000})
+		fmt.Println("正在初始化多类目商品与库存数据...")
+
+		// 1. 初始化商品档案 (涵盖了普通商品、生鲜、虚拟物品)
+		db.Create(&Product{ID: 101, Name: "iPhone 15 Pro", Category: "electronics"})
+		db.Create(&Product{ID: 102, Name: "波士顿大龙虾", Category: "seafood"})
+		db.Create(&Product{ID: 103, Name: "王者荣耀点券", Category: "virtual"})
+
+		// 2. 初始化库存
+		db.Create(&Inventory{ProductID: 101, Count: 1000})
+		db.Create(&Inventory{ProductID: 102, Count: 500})
+		db.Create(&Inventory{ProductID: 103, Count: 9999})
 	}
 }
 
@@ -92,10 +108,47 @@ func main() {
 	r.POST("/trade/close_timeout", handleCloseTimeout)
 	//辅助接口：重置数据（方便测试）
 	r.POST("/trade/reset", handleReset)
+	//查询订单详情
+	r.GET("/trade/order", handleQueryOrder)
+	//用户主动取消订单
+	r.POST("trade/cancel", handleUserCancel)
+	//刻意制造“故障订单”的接口
+	r.POST("/trade/create_bug_order", handleCreateBugOrder)
+	r.POST("/internal/force_inventory_sync", handleForceInventorySync)
+	r.POST("/internal/mark_manual_review", handleMarkManualReview)
+	r.POST("/trade/create_virtual_bug", handleCreateVirtualBug)
 	fmt.Println("Mock业务服务启动：8877")
 	r.Run(":8877")
 }
-
+func handleCreateBugOrder(c *gin.Context) {
+	// 刻意制造一个 BUG_ 开头的单号
+	orderNo := fmt.Sprintf("BUG_%d", time.Now().UnixNano())
+	now := time.Now()
+	//强制插入一条待支付订单
+	db.Create(&Order{
+		OrderNo:   orderNo,
+		UserID:    888,
+		ProductID: 102,
+		Status:    0,
+		CreatedAt: now,
+	})
+	//直接塞入给Outbox发给kafka走延迟调度链路
+	payloadMap := map[string]interface{}{
+		"orderNo":    orderNo,
+		"createTime": now.Unix(),
+	}
+	payloadBytes, _ := json.Marshal(payloadMap)
+	db.Create(&EventOutbox{
+		OrderNo:  orderNo,
+		Payload:  string(payloadBytes),
+		Status:   0,
+		CreateAt: now,
+	})
+	c.JSON(http.StatusOK, gin.H{
+		"msg":     "💣 故障订单注入成功，2分钟后观察 Worker 和 DLQ 表现！",
+		"orderNo": orderNo,
+	})
+}
 func handleCreateOrder(c *gin.Context) {
 	// 生成全局唯一订单号
 	// 用 UnixNano 可以避免高并发下订单号冲突
@@ -320,14 +373,177 @@ func handleCloseTimeout(c *gin.Context) {
 // 重置数据接口，方便反复测试
 func handleReset(c *gin.Context) {
 	db.Exec("TRUNCATE TABLE orders")
-	db.Exec("UPDATE inventories SET count=100 WHERE product_id=101")
+	db.Exec("TRUNCATE TABLE event_outboxes")
+	db.Exec("UPDATE inventories SET count=10000 WHERE product_id=101")
 	//重新插入超时订单
-	now := time.Now()
-	for i := 0; i < 5; i++ {
-		db.Create(&Order{OrderNo: fmt.Sprintf("TIMEOUT_%d", i),
-			Status:    0,
-			CreatedAt: now.Add(-1 * time.Hour),
-		})
-	}
+
 	c.JSON(200, gin.H{"msg": "数据已重置"})
+}
+
+// ==========================================
+// Agent 专用接口：查询订单状态
+// ==========================================
+func handleQueryOrder(c *gin.Context) {
+	orderNo := c.Query("order_no")
+	var order Order
+	if err := db.Where("order_no = ?", orderNo).First(&order).Error; err != nil {
+		c.JSON(404, gin.H{"error": "订单不存在!"})
+		return
+	}
+	//将状态翻译为可读字符串，方便大模型理解
+	// 把数据库的 int 状态翻译成大模型容易理解的文字
+	statusStr := "未知状态"
+	switch order.Status {
+	case 0:
+		statusStr = "待支付"
+	case 1:
+		statusStr = "已支付"
+	case 2:
+		statusStr = "已关闭/已取消"
+	case 3:
+		statusStr = "人工挂起复核中"
+	}
+	c.JSON(200, gin.H{
+		"order_no":    order.OrderNo,
+		"status":      statusStr,
+		"productID":   order.ProductID,
+		"status_code": order.Status,
+		"create_at":   order.CreatedAt.Format(time.RFC3339),
+	})
+}
+
+// ==========================================
+// Agent 专用接口：用户主动取消订单
+// ==========================================
+func handleUserCancel(c *gin.Context) {
+	var req struct {
+		OrderNo string `json:"order_no"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || req.OrderNo == "" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "参数错误，需要提供 order_no",
+		})
+		return
+	}
+	tx := db.Begin()
+	defer func() {
+		if r := recover(); r != nil {
+			tx.Rollback()
+		}
+	}()
+	var order Order
+	//悲观锁，锁住订单，防止定时任务和用户同时取消
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("order_no = ?", req.OrderNo).First(&order).Error; err != nil {
+		tx.Rollback()
+		c.JSON(http.StatusNotFound, gin.H{
+			"error": "订单不存在",
+		})
+		return
+	}
+	//业务校验，只有待支付状态才能取消
+	if order.Status != 0 {
+		tx.Rollback()
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": fmt.Sprintf("当前订单状态不支持取消，状态码: %d", order.Status),
+		})
+		return
+	}
+	//到这里说明找到的订单是可以取消的
+	//改状态
+	order.Status = 2
+	if err := tx.Save(&order).Error; err != nil {
+		tx.Rollback()
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "取消失败，系统异常"})
+		return
+	}
+	//退库存
+	if err := tx.Model(&Inventory{}).Where("product_id = ?", 101).
+		UpdateColumn("count", gorm.Expr("count + ?", 1)).Error; err != nil {
+		tx.Rollback()
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "退库存失败"})
+		return
+	}
+	//到这里说明可以成功退货了
+	tx.Commit()
+	c.JSON(http.StatusOK, gin.H{
+		"msg":      "订单取消成功，库存已退还",
+		"order_no": req.OrderNo,
+	})
+}
+
+// ==========================================
+// Agent 专属工具 1：强制库存对账 (修复锁超时)
+// ==========================================
+func handleForceInventorySync(c *gin.Context) {
+	var req struct {
+		ProductID int `json:"product_id"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "参数错误"})
+		return
+	}
+
+	// 模拟运维强制对齐库存的过程：直接给对应商品库存 +1
+	if err := db.Model(&Inventory{}).Where("product_id = ?", req.ProductID).
+		UpdateColumn("count", gorm.Expr("count + ?", 1)).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "强制对账失败"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"msg": fmt.Sprintf("✅ 商品 [%d] 强制库存对账完毕，已安全释放资源", req.ProductID)})
+}
+
+// ==========================================
+// Agent 专属工具 2：转交人工挂起 (处理生鲜异常等)
+// ==========================================
+func handleMarkManualReview(c *gin.Context) {
+	var req struct {
+		OrderNo string `json:"order_no"`
+		Reason  string `json:"reason"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "参数错误"})
+		return
+	}
+
+	// 将订单状态修改为 3（代表人工挂起异常状态）
+	if err := db.Model(&Order{}).Where("order_no = ?", req.OrderNo).
+		Update("status", 3).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "挂起失败"})
+		return
+	}
+
+	fmt.Printf("⚠️ 订单 [%s] 已被 AI 挂起转交人工，理由: %s\n", req.OrderNo, req.Reason)
+	c.JSON(http.StatusOK, gin.H{"msg": "✅ 订单已被成功挂起，等待人工介入"})
+}
+
+// ==========================================
+// 专门生成虚拟商品故障单
+// ==========================================
+func handleCreateVirtualBug(c *gin.Context) {
+	orderNo := fmt.Sprintf("VBUG_%d", time.Now().UnixNano())
+	now := time.Now()
+
+	// ProductID 103 是王者荣耀点券（虚拟商品）
+	db.Create(&Order{
+		OrderNo:   orderNo,
+		UserID:    888,
+		ProductID: 103,
+		Status:    0,
+		CreatedAt: now,
+	})
+
+	payloadBytes, _ := json.Marshal(map[string]interface{}{"orderNo": orderNo, "createTime": now.Unix()})
+	db.Create(&EventOutbox{
+		OrderNo:  orderNo,
+		Payload:  string(payloadBytes),
+		Status:   0,
+		CreateAt: now,
+	})
+
+	c.JSON(200, gin.H{
+		"msg":     "🎮 虚拟商品故障单注入成功，准备观察 AI 不同的排障路线！",
+		"orderNo": orderNo,
+	})
 }
