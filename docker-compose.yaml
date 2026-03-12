@@ -225,7 +225,7 @@ services:
     command: ./alert-bin
     environment:
       - KAFKA_BROKERS=kafka:9092
-      - DASHSCOPE_API_KEY=sk-ad406b1d8eff4097badd27a834e4f0dc
+      - DASHSCOPE_API_KEY=${DASHSCOPE_API_KEY}
     depends_on:
       - kafka
 #启动 Qdrant 向量数据库 (用于存放运维 SOP 和 RAG 知识库)

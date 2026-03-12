@@ -1,0 +1,45 @@
+# === Binaries ===
+# 过滤所有编译生成的二进制文件
+*-bin
+mock-bin
+timer-bin
+worker-bin
+alert-bin
+rag-ingester
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# === Go Ecosystem ===
+# 依赖包通常不提交，由 go.mod 管理
+# vendor/ 
+
+# === Environment Variables ===
+# 绝对不要提交包含 API Key 的文件
+.env
+.env.*
+!.env.example
+
+# === Operating System ===
+.DS_Store
+Thumbs.db
+
+# === IDE / Editors ===
+# VS Code
+.vscode/
+# GoLand / IntelliJ
+.idea/
+*.iwu
+*.iws
+
+# === Docker & Database ===
+# 过滤本地运行产生的数据库或持久化文件（如果映射到本地的话）
+mysql_data/
+qdrant_storage/
+*.log
+
+# === Temporary files ===
+tmp/
+out/
