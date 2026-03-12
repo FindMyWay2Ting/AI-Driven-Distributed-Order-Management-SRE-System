@@ -58,12 +58,19 @@ go run rag_ingester.go
 # 创建一个会导致死锁报错的异常订单
 curl -X POST http://localhost:8877/trade/create_bug_order
 ```
-## 📂 项目结构
-.
-├── mock_server/           # 业务逻辑中心：包含订单创建、Outbox Relay 线程及本地消息表处理 [cite: 3]
-├── timer_service/         # 延迟调度微服务：基于 Redis ZSet 实现的分布式任务扫描与 Kafka 派发 [cite: 4]
-├── worker/                # 任务执行单元：负责消费超时任务、执行退库存事务及异常重试逻辑
-├── alert_service/         # 智能自愈模块：AI Agent 监听死信队列，结合 RAG 进行故障排障 [cite: 2]
+## 📂 项目目录结构
+​```text
+
+├── mock_server/           # 业务逻辑中心：包含订单创建、Outbox Relay 线程及本地消息表处理 
+
+├── timer_service/         # 延迟调度微服务：基于 Redis ZSet 实现的分布式任务扫描与 Kafka 派发 
+
+├── worker/         # 任务执行单元：负责消费超时任务、执行退库存事务及异常重试逻辑
+├── alert_service/         # 智能自愈模块：AI Agent 监听死信队列，结合 RAG 进行故障排障 
+
 ├── rag_ingester.go        # 知识入库脚本：将运维 SOP 文本向量化并持久化至 Qdrant
+
 ├── Dockerfile             # 容器化构建定义，支持多阶段构建以优化镜像体积
+
 └── docker-compose.yaml    # 全量服务编排：一键启动 MySQL, Redis, Kafka, Qdrant 及业务组件
+​```
